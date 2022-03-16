@@ -1,0 +1,2162 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>TS Initiative Percentage Entry</title>
+    <!--  (c) 2016 CA Technologies.  All Rights Reserved. -->
+    <!--  Build Date: Wed Feb 01 2017 07:58:06 GMT-0800 (PST) -->
+    
+    <script type="text/javascript">
+        var APP_BUILD_DATE = "Wed Feb 01 2017 07:58:06 GMT-0800 (PST)";
+        var STORY    = "F166";
+        var BUILDER  = "jmartin";
+        var CHECKSUM = 82215852108;
+    </script>
+    
+    <script type="text/javascript" src="/apps/2.1/sdk.js"></script>
+    <!-- our highcharts (needed so that we can add patterns) -->
+    <!-- 
+    <script type="text/javascript" src="/apps/2.1/lib/analytics/analytics-all.js"></script>
+    -->
+    
+    <script type="text/javascript">
+        Rally.onReady(function() {
+             
+Ext.define('CA.agile.technicalservices.util.WsapiUtils',{
+    singleton: true,
+    
+    // given a store config, loads the records while returning a promise
+    loadWsapiRecords: function(config) {
+        var deferred = Ext.create('Deft.Deferred');
+        var default_config = {
+            autoLoad: true
+        };
+        var store_config = Ext.Object.merge(default_config, config);
+
+        Ext.create('Rally.data.wsapi.Store',store_config).load({
+            callback: function(records, operation){
+                if (operation.wasSuccessful()){
+                    deferred.resolve(records);
+                } else {
+                    deferred.reject(operation.error.errors.join(','));
+                }
+            }
+        });
+        return deferred.promise;
+    },
+    
+    // given a store config, loads the records while returning a promise
+    loadSnapshotRecords: function(config) {
+        var deferred = Ext.create('Deft.Deferred');
+
+        var default_config = {
+            removeUnauthorizedSnapshots: true
+        };
+        
+        var store_config = Ext.Object.merge(default_config, config);
+        
+        Ext.create('Rally.data.lookback.SnapshotStore',store_config).load({
+            callback: function(records, operation){
+                if (operation.wasSuccessful()){
+                    deferred.resolve(records);
+                } else {
+                    deferred.reject(operation.error.errors.join(','));
+                }
+            }
+        });
+        return deferred.promise;
+    },
+    
+    getPortfolioItemTypes: function(workspace) {
+        var deferred = Ext.create('Deft.Deferred');
+                
+        var store_config = {
+            fetch: ['Name','ElementName','TypePath'],
+            model: 'TypeDefinition',
+            filters: [
+                {
+                    property: 'TypePath',
+                    operator: 'contains',
+                    value: 'PortfolioItem/'
+                }
+            ],
+            sorters: [ {property:'Ordinal', direction: 'ASC'}],
+            autoLoad: true,
+            listeners: {
+                load: function(store, records, successful) {
+                    if (successful){
+                        deferred.resolve(records);
+                    } else {
+                        deferred.reject('Failed to load types');
+                    }
+                }
+            }
+        };
+        
+        if ( !Ext.isEmpty(workspace) ) {
+            store_config.context = { 
+                project:null,
+                workspace: workspace._ref ? workspace._ref : workspace.get('_ref')
+            };
+        }
+                
+        var store = Ext.create('Rally.data.wsapi.Store', store_config );
+                    
+        return deferred.promise;
+    },
+    
+    loadWsapiRecordsParallel: function(store_config){
+        var deferred = Ext.create('Deft.Deferred'),
+            promises = [],
+            thread_count = 9,
+            me = this;
+
+        var config = Ext.Object.merge({
+            pageSize: 2000
+        },store_config);
+        
+        config.autoLoad = false;
+        config.limit    = config.pageSize;
+        
+        this.fetchWsapiCount(store_config).then({
+            success: function(totalCount){
+                var store = Ext.create('Rally.data.wsapi.Store', config),
+                    totalPages = Math.ceil(totalCount/config.pageSize);
+
+                var pages = _.range(1,totalPages+1,1);
+
+                _.each(pages, function(page){
+                    promises.push(function () {
+                        return me.loadStorePage(page, store);
+                    });
+                });
+
+                PortfolioItemCostTracking.promise.ParallelThrottle.throttle(promises, thread_count, me).then({
+                    success: function(results){
+                        deferred.resolve(_.flatten(results));
+                    },
+                    failure: function(msg){
+                        deferred.reject(Ext.String.format("Parallel Load Problem:", msg));
+                    }
+                });
+            },
+            failure: function(msg){
+                deferred.reject(msg);
+            }
+        });
+        return deferred;
+    },
+    
+    fetchWsapiCount: function(store_config){
+        var deferred = Ext.create('Deft.Deferred');
+
+        var config = Ext.Object.merge(store_config, {
+            fetch: ['ObjectID'],
+            limit: 1,
+            pageSize: 1
+        });
+        
+        Ext.create('Rally.data.wsapi.Store',config).load({
+            callback: function(records, operation, success){
+                if (success){
+                    deferred.resolve(operation.resultSet.totalRecords);
+                } else {
+                    deferred.reject(Ext.String.format("Count Problem: {1}", operation.error.errors.join(',')));
+                }
+            }
+        });
+        return deferred;
+    },
+    
+    loadStorePage: function(pageNum, store){
+        var deferred = Ext.create('Deft.Deferred');
+        
+        store.loadPage(pageNum, {
+            callback: function(records, operation){
+                
+                if (operation.wasSuccessful()){
+                     deferred.resolve(records);
+                } else {
+                    console.error('Operation:', operation);
+                    var msg = operation.error && operation.error.errors.join(',');
+                    if ( Ext.isEmpty(msg) ) {
+                        deferred.reject('Network issue while loading store page');
+                    } else {
+                        deferred.reject(msg + " (lsp)");
+                    }
+                }
+            }
+        });
+
+        return deferred;
+    },
+    
+    fetchAllowedValues: function(model_name, field_name) {
+        var deferred = Ext.create('Deft.Deferred');
+        
+        Rally.data.ModelFactory.getModel({
+            type: model_name,
+            success: function(model) {
+                model.getField(field_name).getAllowedValueStore().load({
+                    callback: function(allowed_values, operation, success) {
+                        deferred.resolve(Ext.Array.map(allowed_values, function(allowed_value){
+                            return allowed_value.get('StringValue');
+                        }));
+                    }
+                });
+            }
+        });
+        return deferred.promise;
+    }
+    
+});
+Ext.define('TSKeys',{
+    singleton: true,
+    
+    percentageKeyPrefix: 'ca.ts.percentage'
+    
+});
+
+/**
+ * A link that pops up a version dialog box
+ */
+
+Ext.define('Rally.technicalservices.InfoLink',{
+    extend: 'Rally.ui.dialog.Dialog',
+    alias: 'widget.tsinfolink',
+    
+    /**
+     * @cfg {String} informationHtml
+     * Additional text to be displayed on the popup dialog (for exmaple,
+     * to add a description of the app's use or functionality)
+     */
+    informationHtml: null,
+    
+    /**
+     * 
+     * cfg {String} title
+     * The title for the dialog box
+     */
+    title: "Build Information",
+    
+    defaults: { padding: 5, margin: 5 },
+
+    closable: true,
+     
+    draggable: true,
+
+    autoShow: true,
+   
+    width: 350,
+    
+    informationalConfig: null,
+    
+    items: [{xtype:'container', itemId:'information' }],
+    
+    initComponent: function() {
+        var id = Ext.id(this);
+        this.title =  "<span class='icon-help'> </span>" + this.title;
+        this.callParent(arguments);
+    },
+    
+    _generateChecksum: function(string){
+        var chk = 0x12345678,
+            i;
+        string = string.replace(/var CHECKSUM = .*;/,"");
+        string = string.replace(/var BUILDER  = .*;/,"");
+        string = string.replace(/\s/g,"");  //Remove all whitespace from the string.
+       
+        for (i = 0; i < string.length; i++) {
+            chk += (string.charCodeAt(i) * i);
+        }
+   
+        return chk;
+    },
+    
+    _checkChecksum: function(container) {
+        var deferred = Ext.create('Deft.Deferred');
+        var me = this;
+        
+        Ext.Ajax.request({
+            url: document.URL,
+            params: {
+                id: 1
+            },
+            success: function (response) {
+                text = response.responseText;
+                if ( CHECKSUM ) {
+                    var stored_checksum = me._generateChecksum(text);
+                    if ( CHECKSUM !== stored_checksum ) {
+                        deferred.resolve(false);
+                        return;
+                    }
+                }
+                deferred.resolve(true);
+            }
+        });
+        
+        return deferred.promise;
+    },
+    
+    _addToContainer: function(container){
+        var config = Ext.apply({
+            xtype:'container',
+            height: 200,
+            overflowY: true
+        }, this.informationalConfig);
+        
+        container.add(config);
+    },
+    
+    afterRender: function() {
+        var app = Rally.getApp();
+        
+        if ( !Ext.isEmpty( this.informationalConfig ) ) {
+            var container = this.down('#information');
+            this._addToContainer(container);
+            
+        }
+        
+        if (! app.isExternal() ) {
+            this._checkChecksum(app).then({
+                scope: this,
+                success: function(result){
+                    if ( !result ) {
+                        this.addDocked({
+                            xtype:'container',
+                            cls: 'build-info',
+                            dock: 'bottom',
+                            padding: 2,
+                            html:'<span class="icon-warning"> </span>Checksums do not match'
+                        });
+                    }
+                },
+                failure: function(msg){
+                    console.log("oops:",msg);
+                }
+            });
+        } else {
+            this.addDocked({
+                xtype:'container',
+                cls: 'build-info',
+                padding: 2,
+                dock: 'bottom',
+                html:'... Running externally'
+            });
+        }
+        this.callParent(arguments);
+    },
+    
+    beforeRender: function() {
+        var me = this;
+        this.callParent(arguments);
+
+        if (this.informationHtml) {
+            this.addDocked({
+                xtype: 'component',
+                componentCls: 'intro-panel',
+                padding: 2,
+                html: this.informationHtml,
+                doc: 'top'
+            });
+        }
+        
+        this.addDocked({
+            xtype:'container',
+            cls: 'build-info',
+            padding: 2,
+            dock:'bottom',
+            html:"This app was created by the CA AC Technical Services Team."
+        });
+        
+        if ( APP_BUILD_DATE ) {
+            var build_html = Ext.String.format("Built on: {0} <br/>Built by: {1}",
+                APP_BUILD_DATE,
+                BUILDER);
+                
+            if ( STORY ) {
+                build_html = build_html + "<br/>Source story: " + STORY;
+            }
+                
+            this.addDocked({
+                xtype:'container',
+                cls: 'build-info',
+                padding: 2,
+                dock: 'bottom',
+                html: build_html
+            });
+        }
+    }
+});
+
+/*
+ */
+Ext.define('Rally.technicalservices.Logger',{
+    constructor: function(config){
+        Ext.apply(this,config);
+    },
+    log: function(args){
+        var timestamp = "[ " + Ext.util.Format.date(new Date(), "Y-m-d H:i:s.u") + " ]";
+        //var output_args = arguments;
+        //output_args.unshift( [ "[ " + timestamp + " ]" ] );
+        //output_args = Ext.Array.push(output_args,arguments);
+        
+        var output_args = [];
+        output_args = Ext.Array.push(output_args,[timestamp]);
+        output_args = Ext.Array.push(output_args, Ext.Array.slice(arguments,0));
+
+        window.console && console.log.apply(console,output_args);
+    }
+
+});
+
+/*
+ * 
+ * For putting on the settings panel -- allows for a dropdown  representing a field and one representing its values
+ * 
+ */
+Ext.define('CA.technicalservices.settings.FieldValuePairField', {
+    extend:'Ext.form.field.Base',
+    alias: 'widget.tsfieldvaluepairfield',
+
+    fieldSubTpl: '<div id="{id}" class="settings-grid"></div>',
+    store: undefined,
+    
+    /**
+     * @cfg {String} blankText
+     */
+    blankText : 'Use + to add a field/value pair',
+
+    labelAlign: 'top',
+    
+    /**
+     * @cfg {String|Rally.data.wsapi.Model} model (req)
+     * Model from which the fields will be available
+     */
+    model: null,
+
+    onDestroy: function() {
+        if (this._grid) {
+            this._grid.destroy();
+            delete this._grid;
+        }
+        this.callParent(arguments);
+    },
+    
+    initComponent: function(){
+        this.callParent();
+        this.addEvents('ready');
+
+        if ( Ext.isEmpty(this.model) ) {
+            console.error('Must supply model for CA.technicalservices.settings.FieldValuePairField');
+            return;
+        }
+        
+    },
+    
+    onRender: function() {
+        this.callParent(arguments);
+        this._buildFieldValueGrid();        
+    },
+    
+    _buildFieldValueGrid: function() {
+        var container = Ext.create('Ext.container.Container',{
+            layout: { type:'hbox' },
+            renderTo: this.inputEl,
+            minHeight: 50,
+            minWidth: 50
+        });
+        
+        container.doLayout();
+                
+        var decoded_value = [];
+        if (this.initialConfig && this.initialConfig.value && !_.isEmpty(this.initialConfig.value)){
+            if (!Ext.isObject(this.initialConfig.value)){
+                decoded_value = Ext.JSON.decode(this.initialConfig.value);
+            } else {
+                decoded_value = this.initialConfig.value;
+            }
+            decoded_value = Ext.Array.map(decoded_value, function(val) {
+                return { "FieldName": val.property, "FieldValue": val.value};
+            });
+        }
+       
+        var empty_text = "No selections";
+        
+        console.log('initial config', this._value, this.initialConfig, decoded_value);
+
+        var custom_store = Ext.create('Ext.data.Store',{
+            fields: ['FieldName','FieldValue'],
+            data: decoded_value
+        });
+        
+        var grid_width = Math.min(container.getWidth(true)-50,500);
+
+        this._grid = container.add({
+            xtype:'rallygrid',
+            autoWidth: true,
+            columnCfgs: this._getColumns(),
+            showRowActionsColumn:false,
+            showPagingToolbar: false,
+            store: custom_store,
+            height: 150,
+            margin: 3,
+            width: grid_width,
+            emptyText: empty_text,
+            editingConfig: {
+                publishMessages: false
+            }
+        });
+        
+        
+        container.add({
+            xtype: 'rallybutton',
+            text: '+',
+            margin: '3 0 0 10',
+            listeners: {
+                scope: this,
+                click: function(){
+                    Ext.create('CA.technicalservices.FieldValuePickerDialog',{
+                        autoShow: true,
+                        width: 250,
+                        heigh: 250,
+                        model: this.model,
+                        listeners: {
+                            scope: this,
+                            itemschosen: function(new_data){
+                                this._grid.getStore().add(new_data);
+                            }
+                        }
+                    });                
+                }
+            }
+        });
+        this.fireEvent('ready', true);
+
+    },
+    
+    _removeValue: function() {
+        this.grid.getStore().remove(this.record);
+    },
+    
+    _getColumns: function() {
+        var me = this;
+        return [
+        {
+            xtype: 'rallyrowactioncolumn',
+            scope: this,
+            rowActionsFn: function(record){
+                return  [
+                    {text: 'Remove', record: record, handler: me._removeValue, grid: me._grid }
+                ];
+            }
+        },
+        {
+            text: 'Field Name',
+            dataIndex: 'FieldName',
+            flex: 1,
+            editor: false
+        },
+        {
+            text: 'Field Value',
+            dataIndex: 'FieldValue',
+            flex: 1,
+            editor: false
+        }
+        ];
+    },
+    
+    _getSettingValue: function() {
+        var store = this._grid.getStore();
+
+        var selections = [];
+        store.each(function(record) {
+            var filter = {property:record.get('FieldName'),value: record.get('FieldValue')};
+            selections.push(filter);
+        }, this);
+        
+        return selections;
+    },
+    
+    getSubmitData: function() {
+        var data = {};
+        data[this.name] = Ext.JSON.encode(this._getSettingValue());
+        return data;
+    },
+    
+    setValue: function(value) {
+        console.log('setValue', value);
+        this.callParent(arguments);
+        this._value = value;
+    }
+});
+Ext.define('CA.technicalservices.FieldValuePickerDialog', {
+    extend: 'Rally.ui.dialog.Dialog',
+    alias: 'widget.tsfieldvaluepickerdialog',
+
+    minWidth: 250,
+    minHeight: 250,
+    
+    layout: 'vbox',
+    closable: true,
+    draggable: true,
+
+    config: {
+        /**
+         * @cfg {String}
+         * Title to give to the dialog
+         */
+        title: 'Choose Field & Value',
+
+        /**
+         * @cfg {String}
+         * Text to be displayed on the button when selection is complete
+         */
+        selectionButtonText: 'Done',
+        
+        /**
+         * @cfg {String} model (Required)
+         * 
+         */
+        model: null
+    },
+
+    constructor: function(config) {
+        this.mergeConfig(config);
+
+        this.callParent([this.config]);
+    },
+
+    selectionCache: [],
+
+    initComponent: function() {
+        this.callParent(arguments);
+
+        this.addCls(['chooserDialog', 'chooser-dialog']);
+    },
+
+    beforeRender: function() {
+        this.callParent(arguments);
+
+        this.addDocked({
+            xtype: 'toolbar',
+            dock: 'bottom',
+            padding: '0 0 10 0',
+            layout: {
+                type: 'hbox',
+                pack: 'center'
+            },
+            ui: 'footer',
+            items: [
+                {
+                    xtype: 'rallybutton',
+                    itemId: 'doneButton',
+                    text: this.selectionButtonText,
+                    cls: 'primary rly-small',
+                    scope: this,
+                    disabled: true,
+                    userAction: 'clicked done in dialog',
+                    handler: function() {
+                        this.fireEvent('itemschosen', this.getSelectedRecords());
+                        this.close();
+                    }
+                },
+                {
+                    xtype: 'rallybutton',
+                    text: 'Cancel',
+                    cls: 'secondary rly-small',
+                    handler: this.close,
+                    scope: this,
+                    ui: 'link'
+                }
+            ]
+        });
+
+        this._addFieldSelector();
+    },
+
+    _addFieldSelector: function() {
+        this.fieldSelector = this.add({
+            xtype:'rallyfieldcombobox',
+            model:this.model,
+            fieldLabel: 'Field:',
+            labelAlign: 'top',
+            width: 175,
+            margin: 10,
+            _isNotHidden: function(field) {
+                //if ( field.hidden ) { return false; }
+
+                var attribute_definition = field.attributeDefinition;
+                if ( Ext.isEmpty(attribute_definition) ) { return false; }
+                
+                if ( attribute_definition.AttributeType == "BOOLEAN" ) { return true; }
+                if ( attribute_definition.AttributeType == "RATING" )  { return true; }
+                if ( attribute_definition.AttributeType == "STRING" && attribute_definition.Constrained == true ) { return true; }
+                
+                console.log(field.name, attribute_definition);
+                return false;
+            },
+            
+            listeners: {
+                change: this._addValueSelector,
+                scope: this
+            }
+        });
+    },
+
+    _addValueSelector: function() {
+        if ( this.valueSelector ) { this.valueSelector.destroy(); }
+        this.down('#doneButton').setDisabled(true);
+        
+        this.valueSelector = this.add({
+            xtype:'rallyfieldvaluecombobox',
+            model: this.model,
+            field: this.fieldSelector.getValue(),
+            fieldLabel: 'Value:',
+            labelAlign: 'top',
+            width: 175,
+            margin: 10,
+            listeners: {
+                change: function() { this.down('#doneButton').setDisabled(false); },
+                scope: this
+            }
+        });
+    },
+    
+    getSelectedRecords: function() {
+        return {
+            FieldName: this.fieldSelector.getValue(),
+            FieldValue: this.valueSelector.getValue()
+        }
+    }
+
+});
+
+Ext.define('TSDateCalculator',{
+    singleton: true,
+    
+    // all of the first day counts as 1 day.  So December 1 at 5am is 1 day, so is 6pm.
+    getDaysAfterMonthEnd: function(check_date) {
+        var month = check_date.getMonth();
+        var year = check_date.getFullYear();
+        var month_end = new Date(year,month,1);
+        
+        return Rally.util.DateTime.getDifference(check_date,month_end,'day') + 1;
+    },
+    
+    // all of the last day counts as 1 day.  So December 31 at 5am is 1 day, so is 6pm.
+    getDaysBeforeMonthEnd: function(check_date) {
+        var month = check_date.getMonth();
+        var year = check_date.getFullYear();
+        var month_end = Rally.util.DateTime.add(new Date(year,month,1),'month',1);
+        
+        return Rally.util.DateTime.getDifference(month_end,check_date,'day') + 1;
+    },
+    
+    // given a date, and boundary limits for either side of a month end date, what's the
+    // month this date is in (if any)?
+    getMonthNameInLimits: function(check_date, before_limit, after_limit) {
+        var before_days = this.getDaysBeforeMonthEnd(check_date);
+        var after_days = this.getDaysAfterMonthEnd(check_date);
+        
+        if ( before_limit + after_limit >= 30 ) {
+            return null;
+        }
+        
+        if ( before_days <= before_limit ) {
+            return Ext.Date.format(check_date,'F');
+        }
+        
+        if ( after_days <= after_limit ) {
+            var last_month = Rally.util.DateTime.add(check_date,'month',-1);
+            return Ext.Date.format(last_month,'F');
+        }
+        
+        return null;
+    },
+    
+    getMonthIsoInLimits: function(check_date, before_limit, after_limit) {
+        var before_days = this.getDaysBeforeMonthEnd(check_date);
+        var after_days = this.getDaysAfterMonthEnd(check_date);
+        
+        if ( before_limit + after_limit >= 30 ) {
+            return null;
+        }
+        
+        if ( before_days <= before_limit ) {
+            return Ext.Date.format(check_date,'Y-m-01');
+        }
+        
+        if ( after_days <= after_limit ) {
+            var last_month = Rally.util.DateTime.add(check_date,'month',-1);
+            return Ext.Date.format(last_month,'Y-m-01');
+        }
+        
+        return null;
+    }
+
+});
+Ext.override(Rally.ui.grid.plugin.TreeGridChildPager,{
+
+    _storeHasMoreChildPages: function(parentRecord) {
+        return false;
+//        var loadedCount = this._getLoadedCount(parentRecord);
+//        return parentRecord.get('leafCount') > loadedCount;
+    }
+
+});
+
+Ext.define('CA.technicalservices.ProjectTreePickerDialog', {
+    extend: 'Rally.ui.dialog.Dialog',
+    alias: 'widget.projecttreepickerdialog',
+
+    minWidth: 400,
+    width: 400,
+    minHeight: 300,
+    height: 300,
+    
+    layout: 'fit',
+    closable: true,
+    draggable: true,
+
+    config: {
+        /**
+         * @cfg {String}
+         * Title to give to the dialog
+         */
+        title: 'Choose Project(s)',
+        /**
+         * 
+         * @cfg {String} introText
+         * 
+         *  Informational text to include on the dialog.
+         */
+        introText: null,
+        
+        /**
+         * @cfg {Boolean}
+         * Allow multiple selection or not
+         */
+        multiple: true,
+        
+        /**
+         * @cfg {Boolean} leavesOnly
+         * Only allow the user to choose leaf node projects
+         */
+        
+        leavesOnly: false,
+        
+        /**
+         * @cfg {Object}  || Rally.data.wsapi.Filter[]  
+         * Name of top project to start building the tree down through the hierarchy.
+         */
+        root_filters: [{
+                property: 'Parent',
+                value: ""
+        },{
+            property:'State',
+            value:'Open'
+        }],
+
+        /**
+         * @cfg {Object}
+         * An {Ext.data.Store} config object used when building the grid
+         * Handy when you need to limit the selection with store filters
+         */
+        storeConfig: {
+            context: {
+                project: null
+            },
+            sorters: [
+                {
+                    property: 'Name',
+                    direction: 'DESC'
+                }
+            ]
+        },
+
+        /**
+         * @cfg {Ext.grid.Column}
+         * List of columns that will be used in the chooser
+         */
+        columns: [
+            'Name'
+        ],
+
+        /**
+         * @cfg {String}
+         * Text to be displayed on the button when selection is complete
+         */
+        selectionButtonText: 'Done',
+
+        /**
+         * @cfg {Object}
+         * The grid configuration to be used when creative the grid of items in the dialog
+         */
+        gridConfig: {},
+
+        /**
+         * @cfg {Object[] || Rally.data.wsapi.Model[]}  initialSelectedRecords
+         * The records to select when the chooser loads.  Provide either configuration objects
+         * (with at lease { _ref: xxx } defined) or models
+         */
+        initialSelectedRecords: undefined,
+
+        /**
+         * @cfg showRadioButtons {Boolean}
+         */
+        showRadioButtons: true,
+        
+        /**
+         * @cfg showSearchBox {Boolean}
+         * 
+         * [ Experimental.  Search box might not work ]
+         */
+        showSearchBox: false
+    },
+
+    constructor: function(config) {
+        this.mergeConfig(config);
+
+        this.callParent([this.config]);
+    },
+
+    selectionCache: [],
+
+    initComponent: function() {
+        this.callParent(arguments);
+
+        this.addEvents(
+            /**
+             * @event artifactchosen
+             * Fires when user clicks done after choosing an artifact
+             * @param {Rally.ui.dialog.ArtifactChooserDialog} source the dialog
+             * @param {Rally.data.wsapi.Model}| {Rally.data.wsapi.Model[]} selection selected record or an array of selected records if multiple is true
+             */
+            'itemschosen'
+        );
+
+        this.addCls(['chooserDialog', 'chooser-dialog']);
+    },
+
+    destroy: function() {
+        //      this._destroyTooltip();
+        this.callParent(arguments);
+    },
+
+    beforeRender: function() {
+        this.callParent(arguments);
+
+        this.addDocked({
+            xtype: 'toolbar',
+            dock: 'bottom',
+            padding: '0 0 10 0',
+            layout: {
+                type: 'hbox',
+                pack: 'center'
+            },
+            ui: 'footer',
+            items: [
+                {
+                    xtype: 'rallybutton',
+                    itemId: 'doneButton',
+                    text: this.selectionButtonText,
+                    cls: 'primary rly-small',
+                    scope: this,
+                    disabled: true,
+                    userAction: 'clicked done in dialog',
+                    handler: function() {
+                        this.fireEvent('itemschosen', this.getSelectedRecords());
+                        this.close();
+                    }
+                },
+                {
+                    xtype: 'rallybutton',
+                    text: 'Cancel',
+                    cls: 'secondary rly-small',
+                    handler: this.close,
+                    scope: this,
+                    ui: 'link'
+                }
+            ]
+        });
+
+        if (this.introText) {
+            this.addDocked({
+                xtype: 'component',
+                componentCls: 'intro-panel',
+                html: this.introText
+            });
+        }
+
+        if ( this.showSearchBox ) {
+            this.addDocked({
+                xtype: 'toolbar',
+                itemId: 'searchBar',
+                dock: 'top',
+                border: false,
+                padding: '0 0 10px 0',
+                items: this.getSearchBarItems()
+            });
+        }
+
+        this.buildGrid();
+
+        this.selectionCache = this.getInitialSelectedRecords() || [];
+    },
+
+    /**
+     * Get the records currently selected in the dialog
+     * {Rally.data.Model}|{Rally.data.Model[]}
+     */
+    getSelectedRecords: function() {
+        return this.multiple ? this.selectionCache : this.selectionCache[0];
+    },
+
+    getSearchBarItems: function() {
+        
+        return [
+            {
+                xtype: 'triggerfield',
+                cls: 'rui-triggerfield chooser-search-terms',
+                emptyText: 'Search Keyword or ID',
+                enableKeyEvents: true,
+                flex: 1,
+                itemId: 'searchTerms',
+                listeners: {
+                    keyup: function (textField, event) {
+                        if (event.getKey() === Ext.EventObject.ENTER) {
+                            this._search();
+                        }
+                    },
+                    afterrender: function (field) {
+                        field.focus();
+                    },
+                    scope: this
+                },
+                triggerBaseCls: 'icon-search chooser-search-icon'
+            }
+        ];
+    },
+    getStoreFilters: function() {
+        return [];
+    },
+
+    buildGrid: function() {
+        if (this.grid) {
+            this.grid.destroy();
+        }
+        var me = this;
+
+        this.setLoading('Fetching Project Tree...');
+        Ext.create('Rally.data.wsapi.ProjectTreeStoreBuilder').build({
+            models: ['project'],
+            autoLoad: true,
+            enableHierarchy: true,
+            filters: me.root_filters,
+            sorters: [{property:'Name'}],
+            _getChildNodeFilters: function(node) {
+                var parentType = node.self.typePath,
+                    childTypes = this._getChildTypePaths([parentType]),
+                    parentFieldNames = this._getParentFieldNames(childTypes, parentType);
+
+                if (parentFieldNames.length) {
+                    var open_filter = Ext.create('Rally.data.wsapi.Filter',{
+                        property:'State',
+                        value:'Open'
+                    });
+                    
+                    var base_filters = Rally.data.wsapi.Filter.or(_.map(parentFieldNames, function(parentFieldName) {
+                        return {
+                            property: parentFieldName,
+                            operator: '=',
+                            value: node.get('_ref')
+                        };
+                    }));
+                    
+                    return [
+                        open_filter.and(base_filters)
+                    ];
+                }
+
+                return [];
+            }
+        }).then({
+            scope: this,
+            success: function(store) {
+
+                var mode = this.multiple ? 'MULTI' : 'SINGLE';
+                var leavesOnly = this.leavesOnly;
+                
+                var checkbox_model = Ext.create('Rally.ui.selection.CheckboxModel', {
+                    mode: mode,
+                    enableKeyNav: false,
+                    allowDeselect: true,
+                    isRowSelectable: function (record) {
+                        if ( leavesOnly ) {
+                            return record.get("leaf");
+                        }
+                        return false;
+                    }
+                });
+
+                this.grid = this.add({
+                    xtype: 'rallytreegrid',
+                    treeColumnDataIndex: 'Name',
+                    treeColumnHeader: 'Name',
+                    viewConfig: {
+                        cls: 'grid-view-bulk-edit'
+                    },
+                    enableRanking: false,
+                    enableEditing: false,
+                    enableBulkEdit: false,
+                    shouldShowRowActionsColumn: false,
+
+                    selModel: checkbox_model,
+                    _defaultTreeColumnRenderer: function (value, metaData, record, rowIdx, colIdx, store) {
+                        store = store.treeStore || store;
+                        return Rally.ui.renderer.RendererFactory.getRenderTemplate(store.model.getField('Name')).apply(record.data);
+                    },
+                    columnCfgs: [],
+                    store: store
+                });
+
+                this.mon(this.grid, {
+                    beforeselect: this._onGridSelect,
+                    beforedeselect: this._onGridDeselect,
+                    load: this._onGridLoad,
+                    scope: this
+                });
+                this.add(this.grid);
+                this._onGridReady();
+            }
+        }).always(function() { me.setLoading(false);} );
+    },
+    
+    
+
+    _enableDoneButton: function() {
+        this.down('#doneButton').setDisabled(this.selectionCache.length ? false : true);
+    },
+
+    _findRecordInSelectionCache: function(record){
+        var me = this;
+        return _.findIndex(this.selectionCache, function(cachedRecord) {
+            return me._specialGet(cachedRecord,'_ref') === me._specialGet(record,'_ref');
+        });
+    },
+
+    _onGridSelect: function(selectionModel, record) {
+        var index = this._findRecordInSelectionCache(record);
+
+        if (index === -1) {
+            if (!this.multiple) {
+                this.selectionCache = [];
+            }
+            this.selectionCache.push(record);
+        }
+
+        this._enableDoneButton();
+    },
+
+    _onGridDeselect: function(selectionModel, record) {
+        var index = this._findRecordInSelectionCache(record);
+        if (index !== -1) {
+            this.selectionCache.splice(index, 1);
+        }
+        this._enableDoneButton();
+    },
+
+    _onGridReady: function() {
+        if (!this.grid.rendered) {
+            this.mon(this.grid, 'afterrender', this._onGridReady, this, {single: true});
+            return;
+        }
+
+        if (this.grid.getStore().isLoading()) {
+            this.mon(this.grid, 'load', this._onGridReady, this, {single: true});
+            return;
+        }
+
+        this._onGridLoad();
+        this.center();
+    },
+    
+    _specialGet: function(item, field) {
+        if ( Ext.isEmpty(item) ) { 
+            return null;
+        }
+        
+        if ( Ext.isFunction(item.get) ) { 
+            return item.get(field);
+        }
+        
+        return item[field];
+    },
+    
+    _onGridLoad: function() {
+        var store = this.grid.store;
+        var records = [];
+        Ext.Array.each(this.selectionCache, function(record) {
+            var ref = this._specialGet(record,'_ref');
+            var foundNode = store.getRootNode().findChild('_ref',ref,true);
+
+            if (foundNode) {
+                records.push(foundNode);
+            }
+        },this);
+        if (records.length) {
+            this.grid.getSelectionModel().select(records);
+        }
+    },
+    _search: function() {
+        var terms = this._getSearchTerms();
+        var store = this.grid.getStore();
+        //Filter functions call store load so we don't need to refresh the selections becuaes the
+        //onGridLoad function will
+        if (terms) {
+            store.filter([
+                Ext.create('Rally.data.wsapi.Filter',{
+                    property: 'Name',
+                    operator: 'contains',
+                    value: terms
+                })
+            ]);
+        } else {
+            store.clearFilter();
+        }
+
+    },
+    _getSearchTerms: function() {
+        var textBox = this.down('#searchTerms');
+        return textBox && textBox.getValue();
+    }
+});
+
+Ext.override(Rally.data.wsapi.ParentChildMapper, {
+    constructor: function() {
+        this.parentChildTypeMap = {
+            project: [{
+                typePath: 'project', collectionName: 'Children', parentField: 'Parent'
+            }],
+            hierarchicalrequirement: [
+                {typePath: 'defect', collectionName: 'Defects', parentField: 'Requirement'},
+                {typePath: 'task', collectionName: 'Tasks', parentField: 'WorkProduct'},
+                {typePath: 'testcase', collectionName: 'TestCases', parentField: 'WorkProduct'},
+                {typePath: 'hierarchicalrequirement', collectionName: 'Children', parentField: 'Parent'}
+            ],
+            defect: [
+                {typePath: 'task', collectionName: 'Tasks', parentField: 'WorkProduct'},
+                {typePath: 'testcase', collectionName: 'TestCases', parentField: 'WorkProduct'}
+            ],
+            defectsuite: [
+                {typePath: 'defect', collectionName: 'Defects', parentField: 'DefectSuites'},
+                {typePath: 'task', collectionName: 'Tasks', parentField: 'WorkProduct'},
+                {typePath: 'testcase', collectionName: 'TestCases', parentField: 'WorkProduct'}
+            ],
+            testset: [
+                {typePath: 'task', collectionName: 'Tasks', parentField: 'WorkProduct'},
+                {typePath: 'testcase', collectionName: 'TestCases', parentField: 'TestSets'}
+            ]
+        };
+    }
+});
+
+
+Ext.define('Rally.data.wsapi.ProjectTreeStore', {
+
+    extend: 'Rally.data.wsapi.TreeStore',
+    alias: 'store.rallyprojectwsapitreestore',
+    
+    /**
+     * The type definition typePaths to render as root items (required)
+     * @cfg {String[]} parentTypes
+     */
+    parentTypes: ['project'],
+    
+    /**
+     * @property
+     * @private
+     */
+    childLevelSorters: [{
+        property: 'Name',
+        direction: 'ASC'
+    }],
+        
+    getParentFieldNamesByChildType: function(childType, parentType) {
+        return ['Parent'];
+    },
+
+    _getChildNodeFilters: function(node) {
+        var parentType = node.self.typePath,
+            childTypes = this._getChildTypePaths([parentType]),
+            parentFieldNames = this._getParentFieldNames(childTypes, parentType);
+
+        var filter = [];
+        if (parentFieldNames.length) {
+            filter =  [
+                Rally.data.wsapi.Filter.or(_.map(parentFieldNames, function(parentFieldName) {
+                    return {
+                        property: parentFieldName,
+                        operator: '=',
+                        value: node.get('_ref')
+                    };
+                }))
+            ];
+        }
+
+        return filter;
+    },
+
+    filter: function(filters) {
+        console.log('--');
+        this.fireEvent('beforefilter', this);
+        //We need to clear the filters to remove the Parent filter
+        this.filters.clear();
+        this.filters.addAll(filters);
+        this._resetCurrentPage();
+        this.load();
+    },
+    
+    load: function(options) {
+        this.recordLoadBegin({description: 'tree store load', component: this.requester});
+
+        this._hasErrors = false;
+
+        this.on('beforeload', function(store, operation) {
+            delete operation.id;
+        }, this, { single: true });
+
+        options = this._configureLoad(options);
+        options.originalCallback = options.callback;
+        var deferred = Ext.create('Deft.Deferred'),
+            me = this;
+
+        options.callback = function (records, operation, success) {
+            me.dataLoaded = true;
+
+            if (me._pageIsEmpty(operation)) {
+                me._reloadEmptyPage(options).then({
+                    success: function (records) {
+                        // this gives a maximum callstack exceeded error.  don't know why
+                        //me._resolveLoadingRecords(deferred, records, options, operation, success);
+                    },
+                    failure: function() {
+                        me._rejectLoadingRecord(deferred, options, operation);
+                    }
+                });
+            } else {
+                //me._resolveLoadingRecords(deferred, records, options, operation, success);
+            }
+        };
+
+        if (this._isViewReady()) {
+            this._beforeInitialLoad(options);
+        }
+
+        this.callParent([options]);
+
+        return deferred.promise;
+    },
+
+    clearFilter: function(suppressEvent) {
+        this._resetCurrentPage();
+        this.filters.clear();
+        //We need to add the parent filter back in
+        this.filters.addAll(Ext.create('Rally.data.wsapi.Filter',{
+            property: 'Parent',
+            value: ''
+        }));
+
+        if (!suppressEvent) {
+            this.load();
+        }
+    }
+});
+
+Ext.define('Rally.data.wsapi.ProjectTreeStoreBuilder', {
+    extend: 'Rally.data.wsapi.TreeStoreBuilder',
+
+    build: function(config) {
+        config = _.clone(config || {});
+        config.storeType = 'Rally.data.wsapi.ProjectTreeStore';
+
+        return this.loadModels(config).then({
+            success: function(models) {
+                models = _.values(models);
+                return this._buildStoreWithModels(models, config);
+            },
+            scope: this
+        });
+    },
+
+    _useCompositeArtifacts: function (models, config) {
+        return false;
+    }
+});
+Ext.define('TSModel',{
+    extend: 'Ext.data.Model',
+
+    fields: [
+        { name: '_ref', type: 'string' },
+        { name: '_refObjectName', type: 'string' },
+        { name: 'Name', type: 'string' },
+        { name: 'ObjectID', type: 'int' },
+        { name: 'Description', type: 'string' },
+        { name: 'FormattedID', type: 'string' },
+        { name: 'Project', type:'object' },
+        { name: '__pref', type: 'object', defaultValue: undefined},
+
+        { name: '__percentage', type: 'float', useNull: true, defaultValue: undefined, convert: function(value,record){
+            // if value is passed directly, just take it
+            if ( !Ext.isEmpty(value) || value === 0 ) { return value; }
+            
+            // if we've already created the record fully, and we get here it means someone
+            // is blanking it out in the grid  (convert functions are run in order)
+            if ( record.get('__instantiated') ) { return undefined; }
+            
+            var pref = record.get('__pref');
+
+            if ( Ext.isEmpty(pref) ) { return undefined; }
+            var pref_value = Ext.JSON.decode(pref.get('Value'));
+            return pref_value.__percentage;
+        } },
+
+        { name: '__lastChangedBy', type: 'object', convert: function(value,record){
+            // if value is passed directly, just take it
+            if ( !Ext.isEmpty(value) ) { return value; }
+            var pref = record.get('__pref');
+
+            if ( Ext.isEmpty(pref) ) { return null; }
+            var pref_value = Ext.JSON.decode(pref.get('Value'));
+            return pref_value.__lastChangedBy;
+        } },
+        { name: '__lastChangedOn', type: 'string', convert: function(value,record){
+            // if value is passed directly, just take it
+            if ( !Ext.isEmpty(value) ) { return value; }
+            var pref = record.get('__pref');
+            if ( Ext.isEmpty(pref) ) { return null; }
+            var pref_value = Ext.JSON.decode(pref.get('Value'));
+            return pref_value.__lastChangedOn;
+        }},
+        { name: '__monthStart', type: 'string' },
+        { name: '__dataProjectRef', type:'string' }, // for the pref to be assigned to
+        
+        { name: '__instantiated', type:'boolean', defaultValue: false, convert: function(value,record) { return true; } } // end of the list!
+    ],
+    
+    getKey: function() {
+            var key = Ext.String.format("{0}.{1}.{2}",
+                TSKeys.percentageKeyPrefix,
+                this.get('__monthStart'),
+                this.get('ObjectID')
+            );
+            return key;
+    },
+
+    save: function(v) {
+        var changes = this.getChanges();
+
+        if (! Ext.isObject(changes) ) {
+            return;
+        }
+        
+        var user = Rally.getApp().getContext().getUser();
+
+        this.set('__lastChangedBy', {
+            ObjectID: user.ObjectID,
+            _ref: user._ref,
+            _refObjectName: user._refObjectName,
+            UserName: user.UserName
+        });
+        var timestamp = Rally.util.DateTime.toIsoString(new Date());
+        this.set('__lastChangedOn', timestamp);
+        
+        return this._savePercentage();
+    },
+    
+    _savePercentage: function() {
+        var me = this;
+        
+        var json_value = Ext.JSON.encode({
+            __lastChangedOn: this.get('__lastChangedOn'),
+            __lastChangedBy: this.get('__lastChangedBy'),
+            __percentage:    this.get('__percentage')
+        });
+        
+        var pref = this.get('__pref');
+        if ( Ext.isEmpty(pref) ) {
+            console.log("Creating value for new pref:", json_value);
+            return this._createPreference(json_value);
+        } else {
+            console.log("Saving value for existing pref:", json_value);
+            pref.set('Value', json_value);
+            return pref.save();
+        }
+    },
+    
+    _createPreference: function(json_value) {
+        var me = this,
+            key = this.getKey(),
+            project_ref = this.get('__dataProjectRef');
+        
+        var config = {
+            Project: project_ref,
+            Name: key,
+            Value: json_value
+        };
+        
+        Rally.data.ModelFactory.getModel({
+            type: 'Preference',
+            scope: this,
+            success: function(model) {
+                var pref = Ext.create(model,config);
+                pref.save({
+                    callback: function(result, operation) {
+                        me.set('__pref', result);
+                    }
+                });
+            }
+        });
+    }
+});
+Ext.override(Rally.ui.grid.plugin.Validation,{
+    _onBeforeEdit: function(editor, object, eOpts) {
+        // clear this because it won't let us do the getEditor on cells
+    }
+});
+
+Ext.define("TSInitiativePercentageEntry", {
+    extend: 'Rally.app.App',
+    componentCls: 'app',
+    logger: new Rally.technicalservices.Logger(),
+    defaults: { margin: 10 },
+    layout: 'border',
+    
+    items: [
+        {xtype:'container',itemId:'selector_box',region:'north',layout: 'hbox', defaults: { margin: 10 }},
+        {xtype:'container',itemId:'display_box',region: 'center', layout:'fit'}
+    ],
+
+    integrationHeaders : {
+        name : "TSInitiativePercentageEntry"
+    },
+    
+    config: {
+        defaultSettings: {
+            validBeforeMonthEnd: 5,
+            validAfterMonthEnd: 10,
+            initiativeFieldValues: []
+        }
+    },
+    
+    launch: function() {
+        var me = this;
+        this.logger.log('Starting with: ', this.getSettings());
+        this.logger.log('App ID (also Panel OID):', this.getAppId());
+        
+        var before = this.getSetting('validBeforeMonthEnd'),
+            after  = this.getSetting('validAfterMonthEnd');
+        
+        this.monthNameForEntry = TSDateCalculator.getMonthNameInLimits(new Date(), before, after);
+        this.monthIsoForEntry = TSDateCalculator.getMonthIsoInLimits(new Date(), before, after);
+
+        this.logger.log("The month iso: ", this.monthIsoForEntry);
+        
+        if ( Ext.isEmpty(this.monthNameForEntry) ) {
+            this._showAppMessage("Entry during this period is closed.");
+            return;
+        }
+        CA.agile.technicalservices.util.WsapiUtils.getPortfolioItemTypes().then({
+            success: function(pis) {
+                this.PortfolioItemTypes = pis;
+                this._addSelectors();
+            },
+            scope: this
+        });
+    },
+    
+    _addSelectors: function() {
+        var me = this;
+        var container = this.getSelectorBox();
+        var project_filter = [{property:'Children.ObjectID',value:''}];
+        
+        project_filter.push({property:'Owner', value: this.getContext().getUser()._ref});
+        
+        var project_config = {
+            model:'Project',
+            filters: project_filter,
+            pageSize: 2000,
+            sorters: [{property:'Name'}]
+        };
+        
+        CA.agile.technicalservices.util.WsapiUtils.loadWsapiRecords(project_config).then({
+            success: function(projects) {
+                if ( this.getContext().getPermissions().isWorkspaceOrSubscriptionAdmin() ) {
+                    container.add({
+                        xtype:'rallybutton',
+                        text: 'Choose Project',
+                        listeners: {
+                            scope: this,
+                            click: function() {
+                                Ext.create('CA.technicalservices.ProjectTreePickerDialog',{
+                                    autoShow: true,
+                                    title: 'Choose Project',
+                                    multiple: false,
+                                    leavesOnly: true,
+                                    listeners: {
+                                        scope: this,
+                                        itemschosen: function(item){
+                                            console.log('here', item);
+                                            this.selectedProject = item.get('_ref');
+                                            this._updateData();
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    });
+                } else {
+                
+                    if ( projects.length === 0 ) {
+                        this._showAppMessage("You must own at least one project to use this app.");
+                        return;
+                    }
+                    
+                    if ( projects.length == 1 ) {
+                        container.add({
+                            xtype:'container',
+                            html: Ext.String.format("<b>Team:</b> {0}",
+                                projects[0].get('_refObjectName')
+                            )
+                        });
+                        
+                        this.selectedProject = projects[0].get('_ref');
+                        this._updateData();
+                        return;
+                    }
+                                    
+                    var project_data = Ext.Array.map(projects, function(project){return project.getData();});
+                    
+                    container.add({
+                        xtype:'combo',
+                        store: Ext.create('Ext.data.Store',{
+                            fields: ['_refObjectName','ObjectID','_ref'],
+                            data: project_data
+                        }),
+                        fieldLabel: 'Team',
+                        labelWidth: 45,
+                        displayField: '_refObjectName',
+                        valueField: '_ref',
+                        typeAhead: true,
+                        queryMode: 'local'
+                    }).on(
+                        'change', 
+                        function(cb) {
+                            this.selectedProject = cb.getValue();
+                            this._updateData();
+                        }, 
+                        me
+                    );
+                }
+                
+                container.add({
+                    xtype:'container',
+                    cls: 'month-name-display',
+                    html: this.monthNameForEntry
+                });
+        
+            },
+            scope: this
+        });
+    },
+    
+    _updateData: function() {
+        this._clearDisplayBox();
+       
+        if ( Ext.isEmpty(this.selectedProject) ) {
+            return;
+        }
+        this.logger.log('_updateData',this.selectedProject);
+        
+        var project_ref = this.selectedProject;
+        
+        Deft.Chain.pipeline([
+            function() { return this._fetchActiveStoryHierarchies(project_ref); },
+            this._fetchInitiativesFromHierarchies,
+            this._filterOutInitiatives,
+            this._fetchAlreadyEnteredData
+        ],this).then({
+            success: function(results) {
+                var initiatives = results[0],
+                    prefs_by_oid = results[1];
+                
+                this.logger.log("prefs by oid:", prefs_by_oid);
+                
+                var models = Ext.Array.map(initiatives, function(initiative) {
+                    return initiative.getData();
+                });
+                
+                Ext.Array.each(models, function(model){
+                    model.__monthStart = this.monthIsoForEntry;
+                    model.__dataProjectRef = this.selectedProject;
+
+                    if (!Ext.isEmpty(model.ObjectID)){
+                        model.__pref = prefs_by_oid[model.ObjectID];
+                    }
+                },this);
+                
+                this.displayGrid(models);
+            },
+            failure: function(msg) {
+                
+                if ( Ext.isString(msg) ) {
+                    this.showErrorNotification( msg );
+                    return;
+                }
+                if ( Ext.isObject(msg) && !Ext.isEmpty(msg.msg) ) {
+                    this._showAppMessage(msg.msg);
+                }
+            },
+            scope: this
+        });
+    },
+    
+    _fetchActiveStoryHierarchies: function(project_ref) {
+        var deferred = Ext.create('Deft.Deferred'),
+            project_oid = Rally.util.Ref.getOidFromRef(project_ref);
+        
+        var month_start = this.monthIsoForEntry;
+        var next_month = Rally.util.DateTime.toIsoString(
+            Rally.util.DateTime.add(
+                Rally.util.DateTime.fromIsoString(month_start), 'month', 1
+            )
+        );
+        var active_states = ['Defined','In-Progress','Completed'];
+
+        var config = {
+            find: {
+                _TypeHierarchy: { "$in": ['HierarchicalRequirement'] },
+                 Project: project_oid,
+                "$or": [
+                {
+                    ScheduleState: { "$in":  active_states},
+                    "_PreviousValues.ScheduleState": { "$exists": true },
+                    "_ValidFrom": {
+                        "$gte": month_start,
+                        "$lt":  next_month
+                    }
+                },
+                {
+                    ScheduleState: { "$in": active_states },
+                    __At: month_start
+                },
+                {
+                    ScheduleState: { "$in": active_states },
+                    __At: next_month
+                }
+                ]
+            },
+            fetch: ['ObjectID','_ItemHierarchy','Project'],
+            hydrate: ['Project']
+        };
+        
+        CA.agile.technicalservices.util.WsapiUtils.loadSnapshotRecords(config).then({
+            success: function(snapshots) {
+                if ( snapshots.length === 0 ) {
+                    deferred.reject({msg: 'There were no active stories in the month for this project.'});
+                    return;
+                }
+                var hierarchies = {};
+                
+                Ext.Array.map(snapshots, function(snapshot){
+                    hierarchies[snapshot.get('ObjectID')] = snapshot.get('_ItemHierarchy');
+                });
+                
+                deferred.resolve( Ext.Object.getValues(hierarchies) );
+            },
+            failure: function(msg) {
+                deferred.reject(msg);
+            }
+        });
+        
+        return deferred.promise;
+    },
+    
+    _fetchInitiativesFromHierarchies: function(hierarchies) {
+        this.logger.log('_fetchInitiativesFromHierarchies',hierarchies);
+
+        var oids = [];
+        Ext.Array.each(hierarchies, function(hierarchy){
+            hierarchy.pop();
+            oids = Ext.Array.push(oids,hierarchy);
+        });
+        
+        oids = Ext.Array.unique(oids);
+        var filters = Rally.data.wsapi.Filter.or(
+            Ext.Array.map(oids, function(oid){
+                return { property:'ObjectID',value:oid }
+            })
+        );
+        
+        var base_filter = this.getBaseInitiativeFilter();
+        if ( !Ext.isEmpty(base_filter) ) {
+            filters = filters.and(base_filter);
+        }
+        
+        var config = {
+            model: this.PortfolioItemTypes[1].get('TypePath'),
+            filters: filters,
+            fetch: ['FormattedID','Name','Notes','Description','Project'],
+            enablePostGet: true,
+            context: { project: null }
+        };
+        return CA.agile.technicalservices.util.WsapiUtils.loadWsapiRecords(config);
+    },
+    
+    /*
+     * Want to filter out initiatives that did not match a particular value during the month
+     * 
+     */
+    _filterOutInitiatives: function(initiatives) {
+        var initiative_filters = this.getSetting('initiativeFieldValues');
+        if ( Ext.isEmpty(initiatives) || Ext.isEmpty(initiative_filters) ) { return initiatives; }
+        
+        var deferred = Ext.create('Deft.Deferred');
+        if ( Ext.isString(initiative_filters) ) {
+            initiative_filters = Ext.JSON.decode(initiative_filters);
+        }
+        var month_start = this.monthIsoForEntry;
+        var next_month = Rally.util.DateTime.toIsoString(
+            Rally.util.DateTime.add(
+                Rally.util.DateTime.fromIsoString(month_start), 'month', 1
+            )
+        );
+        var oids = Ext.Array.map(initiatives, function(initiative) { return initiative.get('ObjectID'); });
+        
+        initiative_filters.push({property:'ObjectID',operator:'in', value: oids});
+        
+        var base_filters = Rally.data.lookback.QueryFilter.and(initiative_filters);
+        
+        var filters = base_filters.and(
+            Ext.create('Rally.data.lookback.QueryFilter',{property:'_TypeHierarchy', operator:'in', value:['PortfolioItem']})
+        );
+        
+        filters = filters.and(
+            Ext.create('Rally.data.lookback.QueryFilter',{property:'_ValidFrom', operator:'>=', value:month_start})
+        );
+    
+        filters = filters.and(
+            Ext.create('Rally.data.lookback.QueryFilter',{property:'_ValidFrom', operator:'<', value:next_month})
+        );
+        
+        var config = {
+            filters: filters,
+            fetch: ['ObjectID']
+        };
+        
+        CA.agile.technicalservices.util.WsapiUtils.loadSnapshotRecords(config).then({
+            success: function(snapshots) {
+                if ( snapshots.length === 0 ) {
+                    deferred.reject({msg: 'No initiatives meet the filters.'});
+                    return;
+                }
+                
+                var valid_items = {};
+                Ext.Array.map(snapshots, function(snapshot){
+                    valid_items[snapshot.get('ObjectID')] = snapshot;
+                });
+                
+                var valid_initiatives = Ext.Array.filter(initiatives, function(initiative){
+                    var oid = initiative.get('ObjectID');
+                    return !Ext.isEmpty(valid_items[oid]);
+                });
+                
+                deferred.resolve( valid_initiatives );
+            },
+            failure: function(msg) {
+                deferred.reject(msg);
+            }
+        });
+        return deferred.promise;
+    },
+    
+    _fetchAlreadyEnteredData: function(initiatives) {
+        var deferred = Ext.create('Deft.Deferred'),
+            key_prefix = TSKeys.percentageKeyPrefix,
+            month_start = this.monthIsoForEntry;
+        
+        var config = {
+            model: 'Preference',
+            fetch: ['Name','Value'],
+            filters: [
+                {property:'Name',operator:'contains',value: key_prefix + "." + month_start},
+                {property:'Project', value: this.selectedProject}
+            ],
+            context: { project: null }
+        };
+        
+        CA.agile.technicalservices.util.WsapiUtils.loadWsapiRecords(config).then({
+            success: function(prefs) {
+                var prefs_by_oid = {};
+                Ext.Array.each(prefs, function(pref){
+                    var pref_name = pref.get('Name');
+                    var pref_array = pref_name.split('.');
+                    if ( pref_array.length != 5 ) { return; }
+                    prefs_by_oid[pref_array[4]] = pref;
+                });
+                deferred.resolve([initiatives,prefs_by_oid]);
+            },
+            failure: function(msg) {
+                deferred.reject(msg)
+            }
+        });
+        
+        return deferred.promise;
+    },
+    
+    displayGrid: function(initiatives) {
+        this.logger.log('displayGrid', initiatives);
+        
+        var store = Ext.create('Rally.data.custom.Store',{
+            model:'TSModel',
+            data: initiatives
+        });
+        
+        this._clearDisplayBox();
+        
+        var display_box = this.getDisplayBox();
+        
+        display_box.add({
+            xtype:'rallygrid',
+            width: 400,
+            columnCfgs: this._getColumns(),
+            store: store,
+            showPagingToolbar : false,
+            showRowActionsColumn : false,
+            disableSelection: true,
+            enableColumnMove: false,
+            enableColumnResize : false,
+            features: [{
+                ftype: 'summary',
+                dock: 'bottom'
+            }]
+        });
+    },
+    
+    _getColumns: function() {
+        return [
+            { 
+                text: 'Full Name',       
+                xtype: 'templatecolumn', 
+                tpl: Ext.create('Rally.ui.renderer.template.FormattedIDTemplate',{
+                    showIcon: false,
+                    showHover: true
+                })
+            },
+            { dataIndex:'Name',text:'Name', flex: 1},
+            { 
+                dataIndex:'__percentage', 
+                text: 'Percentage', 
+                width: 100,
+                align: 'center',
+                sortable: true,
+                field:'test',
+                getEditor: function(record,df) {
+                    return Ext.create('Ext.grid.CellEditor', {
+                        field: Ext.create('Rally.ui.NumberField', {
+                            xtype:'rallynumberfield',
+                            minValue: 0,
+                            maxValue: 100,
+                            disabled: false,
+                            allowDecimals: false,
+                            selectOnFocus: true,
+                            allowBlank: true,
+                            validator: function(value) {
+                                value = value || 0;
+                                
+                                var grid = this.up('rallygrid'),
+                                    store = grid && grid.getStore();
+                                
+                                if ( !store ) {
+                                    return true;
+                                }
+                                
+                                var count = store.getTotalCount();
+                                var total = 0;
+                                
+                                // get the values in the store
+                                for ( var i=0; i<count; i++ ) {
+                                    var stored_record = store.getAt(i);
+                                    var row_value = stored_record.get('__percentage') || 0;
+                                    total = total + row_value;
+                                }
+                                // adjust for change (original value is already 
+                                // in the store so the loop above pulled it, but we
+                                // want to replace it with the new value
+                                var original_value = record.get("__percentage") || 0;
+                                
+                                total = total - original_value + parseFloat(value,10);
+                                
+                                if ( total > 100) {
+                                    return "The total (" + total + ") is greater than 100%";
+                                }
+                                return true;
+                            }
+                        })
+                    });
+                },
+                summaryType: function(values){
+                    var total = 0;
+                    Ext.Array.each(values, function(value){
+                        total += value.get('__percentage') || 0;
+                    });
+                    return total;
+                },
+                summaryRenderer: function(value, summaryData, dataIndex) {
+                    if ( value === 0 ) { return; }
+                    return Ext.String.format('TOTAL: {0}%', value); 
+                },
+                renderer: function(value,meta,record) {
+                    if ( value === null || isNaN(value)) {
+                        return "";
+                    }
+                    return value + '%';
+                }
+            }
+        ];
+    },
+    
+    getSelectorBox: function() {
+        return this.down('#selector_box');
+    },
+    
+    getDisplayBox: function() {
+        return this.down('#display_box');
+    },
+    
+    getLowestLevelPITypePath: function() {
+        return this.PortfolioItemTypes[0].get('TypePath');
+    },
+    
+    _showAppMessage: function(msg){
+        var display_box = this.getDisplayBox();
+        display_box.removeAll();
+        
+        var ct = display_box.add({
+            xtype: 'container',
+            tpl: '<div class="no-data-container"><div class="secondary-message">{message}</div></div>'
+        });
+        ct.update({message: msg});
+    },
+    
+    _clearDisplayBox: function() {
+        var display_box = this.getDisplayBox();
+        display_box.removeAll();
+    },
+    
+    getBaseInitiativeFilter: function() {
+        if (this.getSetting('query')){
+            return Rally.data.wsapi.Filter.fromQueryString(this.getSetting('query'));
+        }
+        return null;
+    },
+    
+    getSettingsFields: function() {
+        var type_path = "PortfolioItem/Initiative";
+        if ( this.PortfolioItemTypes && this.PortfolioItemTypes.length > 1) {
+            type_path = this.PortfolioItemTypes[1].get('TypePath');
+        }
+        
+        
+        return [
+            { 
+                xtype:'rallynumberfield',
+                name: 'validBeforeMonthEnd',
+                fieldLabel: 'Days Before Month End',
+                minValue: 0,
+                maxValue: 14
+            },
+            { 
+                xtype:'rallynumberfield',
+                name: 'validAfterMonthEnd',
+                fieldLabel: 'Days After Month End',
+                minValue: 0,
+                maxValue: 14
+            },
+            {
+                xtype:'tsfieldvaluepairfield',
+                name: 'initiativeFieldValues',
+                model: type_path,
+                fieldLabel: 'Initiative Field Matched During the Month:'
+            }
+        ];
+    },
+    
+    getOptions: function() {
+        return [
+            {
+                text: 'About...',
+                handler: this._launchInfo,
+                scope: this
+            }
+        ];
+    },
+    
+    _launchInfo: function() {
+        if ( this.about_dialog ) { this.about_dialog.destroy(); }
+        this.about_dialog = Ext.create('Rally.technicalservices.InfoLink',{});
+    },
+    
+    isExternal: function(){
+        return typeof(this.getAppId()) == 'undefined';
+    }
+    
+});
+
+            
+               Rally.launchApp('TSInitiativePercentageEntry', {
+                   name: 'TS Initiative Percentage Entry'
+               });
+        });
+    </script>
+    
+    <style type="text/css">
+
+.app {
+    
+}
+.tsinfolink {
+    position:absolute;
+    right:0px;
+    width: 14px;
+    height: 14px;
+    border-radius: 7px;
+    text-align: center;
+    color: white;
+    background: #C0C0C0;
+    border-style: solid;
+    border-width: 1px;
+    margin-top: 25px;
+    margin-right: 5px;
+    cursor: pointer;
+}
+
+.month-name-display {
+    color: #888;
+    font-size: 18px;
+    font-family: ProximaNova,Helvetica,Arial;
+}
+
+.x-grid-row-summary .x-grid-cell{
+    border-style: solid;
+    border-top: thick single #000;
+}
+
+.x-border-layout-ct {
+    background-color: white;
+}
+    </style>
+
+</head>
+<body></body>
+</html>
